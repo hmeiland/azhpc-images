@@ -1,5 +1,9 @@
 #!/bin/bash
 
+function exit_on_error {
+    if ! [[ -n "$HPC_DEBUG" && "$HPC_DEBUG" == "-d" ]]; then exit -1; fi
+}
+
 # check if the file is present
 function check_exists {
     ls $1
@@ -8,7 +12,7 @@ function check_exists {
         echo "$1 [OK]"
     else
         echo "*** ${FUNCNAME[1]} Error - $1 not found!" >&2
-        if ! [[ -n "$HPC_DEBUG" && "$HPC_DEBUG" == "-d" ]]; then exit -1; fi 
+        exit_on_error
     fi
 }
 
@@ -21,12 +25,12 @@ function check_exit_code {
     else
         echo "*** ${FUNCNAME[1]}: Error - $2!" >&2
         echo "*** Failed with exit code - $exit_code" >&2
-        if ! [[ -n "$HPC_DEBUG" && "$HPC_DEBUG" == "-d" ]]; then exit -1; fi 
+        exit_on_error
     fi
 }
 
 function ver { 
-    printf "%03d%03d%03d" $(echo "$1" | tr '.' ' '); 
+    printf "10#%03d%03d%03d" $(echo "$1" | tr '.' ' '); 
 }
 
 # verify OFED installation
@@ -76,14 +80,14 @@ function verify_hpcx_installation {
 }
 
 function verify_mvapich2_installation {
-    check_exists "${MODULE_FILES_ROOT}/mpi/mvapich2"
+    check_exists "${MODULE_FILES_ROOT}/mpi/mvapich"
 
-    module load mpi/mvapich2
+    module load mpi/mvapich
     # Env MV2_FORCE_HCA_TYPE=22 explicitly selects EDR
-    local mvapich2_omb_path=${MPI_HOME}/libexec/osu-micro-benchmarks/mpi/pt2pt
-    mpiexec -np 2 -ppn 2 -env MV2_USE_SHARED_MEM=0  -env MV2_FORCE_HCA_TYPE=22 ${mvapich2_omb_path}/osu_latency
-    check_exit_code "MVAPICH2 ${VERSION_MVAPICH2}" "Failed to run MVAPICH2"
-    module unload mpi/mvapich2
+    local mvapich_omb_path=${MPI_HOME}/libexec/osu-micro-benchmarks/mpi/pt2pt
+    mpiexec -np 2 -ppn 2 -env MV2_USE_SHARED_MEM=0  -env MV2_FORCE_HCA_TYPE=22 ${mvapich_omb_path}/osu_latency
+    check_exit_code "MVAPICH ${VERSION_MVAPICH}" "Failed to run MVAPICH"
+    module unload mpi/mvapich
 }
 
 function verify_impi_2021_installation {
@@ -101,7 +105,7 @@ function verify_ompi_installation {
     check_exit_code "Open MPI ${VERSION_OMPI}" "Failed to run Open MPI"
 }
 
-function verify_cuda_installation {
+function verify_nvidia_driver_installation {
     # Verify NVIDIA Driver installation
     nvidia_driver_cuda_version=$(nvidia-smi --version | tail -n 1 | awk -F':' '{print $2}' | tr -d "[:space:]")
     check_exit_code "NVIDIA Driver ${VERSION_NVIDIA}" "Failed to run NVIDIA SMI"
@@ -110,6 +114,15 @@ function verify_cuda_installation {
     lsmod | grep nvidia_peermem
     check_exit_code "NVIDIA Peer memory module is inserted" "NVIDIA Peer memory module is not inserted!"
 
+    if [[ "$VMSIZE" == "standard_nd128isr_ndr_gb200_v6" || "$VMSIZE" == "standard_nd128isr_gb300_v6" ]]; then
+        # Verify if NVIDIA driver CDMM mode is enabled
+        cat /proc/driver/nvidia/params | grep -q  "CoherentGPUMemoryMode: \"driver\""
+        check_exit_code "NVIDIA CDMM mode is enabled" "NVIDIA CDMM mode is not enabled!"
+    fi
+}
+
+function verify_cuda_installation {
+    nvidia_driver_cuda_version=$(nvidia-smi --version | tail -n 1 | awk -F':' '{print $2}' | tr -d "[:space:]")
     # Verify if CUDA is installed
     # re-enable this after testing
     # nvcc --version
@@ -117,12 +130,12 @@ function verify_cuda_installation {
     check_exists "/usr/local/cuda/"
     
     # Check that the CUDA runtime version isn't newer than the driver CUDA version.
-    # Having a newer CUDA runtime breaks gpu-burn
-    if [[ $(ver ${VERSION_CUDA}) -gt $(ver ${nvidia_driver_cuda_version})  ]]; then
+    # Having a newer CUDA runtime breaks programs compiled to PTX with the cuda toolkit, such as gpu-burn
+    if [[ $(ver ${VERSION_CUDA}) -le $(ver ${nvidia_driver_cuda_version})  ]]; then
+        echo "[OK] : CUDA runtime version ${VERSION_CUDA} is compatible with the driver CUDA version ${nvidia_driver_cuda_version}"
+    else
         echo "*** Error - CUDA runtime version ${VERSION_CUDA} is newer than the driver CUDA version ${nvidia_driver_cuda_version}"
         exit -1
-    else
-        echo "[OK] : CUDA runtime version ${VERSION_CUDA} is compatible with the driver CUDA version ${nvidia_driver_cuda_version}"    
     fi
 
     # Verify the compilation of CUDA samples
@@ -160,6 +173,29 @@ function verify_nccl_installation {
             -x NCCL_DEBUG=WARN \
             -x NCCL_NET_GDR_LEVEL=5 \
             /opt/nccl-tests/build/all_reduce_perf -b1K -f2 -g1 -e 4G;;
+        standard_nc80adis_h100_v5) mpirun -np 2 \
+                --allow-run-as-root \
+                --map-by ppr:2:node \
+                -x LD_LIBRARY_PATH=/usr/local/nccl-rdma-sharp-plugins/lib:$LD_LIBRARY_PATH \
+                -mca coll_hcoll_enable 0 \
+                -x UCX_TLS=tcp \
+                -x CUDA_DEVICE_ORDER=PCI_BUS_ID \
+                -x NCCL_SOCKET_IFNAME=eth0 \
+                -x NCCL_DEBUG=WARN \
+                -x NCCL_NET_GDR_LEVEL=5 \
+                /opt/nccl-tests/build/all_reduce_perf -b1K -f2 -g1 -e 4G;;
+        standard_nd128isr_ndr_gb200_v6|standard_nd128isr_gb300_v6) mpirun -np 4 \
+            --allow-run-as-root \
+            --map-by ppr:4:node \
+            -x LD_LIBRARY_PATH=/usr/local/nccl-rdma-sharp-plugins/lib:$LD_LIBRARY_PATH \
+            -mca coll_hcoll_enable 0 \
+            -x UCX_TLS=rc \
+            -x UCX_IB_GID_INDEX=0 \
+            -x CUDA_DEVICE_ORDER=PCI_BUS_ID \
+            -x NCCL_SOCKET_IFNAME=eth0 \
+            -x NCCL_DEBUG=WARN \
+            -x NCCL_NET_GDR_LEVEL=5 \
+            /opt/nccl-tests/build/all_reduce_perf -b1K -f2 -g1 -e 4G;;                
         *) ;;
     esac
     check_exit_code "NCCL ${VERSION_NCCL}" "Failed to run NCCL all reduce perf"
@@ -204,15 +240,20 @@ function verify_rccl_installation {
 }
 
 function verify_package_updates {
+    # TODO: wait for pre-depends bug to be fixed in apt https://salsa.debian.org/apt-team/apt/-/merge_requests/549
     case ${ID} in
-        ubuntu) sudo apt -q --assume-no update;;
-        almalinux) sudo yum update -y --setopt tsflags=test;
-            sudo yum clean packages;;
-        azurelinux) sudo dnf update -y --setopt tsflags=test;
-            sudo dnf clean packages;;
+        ubuntu)
+            case ${VERSION_ID} in
+                22.04) true;; # apt is somehow entirely broken for this on ubuntu 22.04 and aptitude doesn't have the notion of phased updates
+                *) ! sudo apt list "?and(?upgradable, ?not(?phasing), ?not(?depends(?phasing)))" -qq 2>/dev/null | grep -q .;;
+            esac;;
+        almalinux)
+            sudo dnf -y makecache 
+            sudo dnf check-update -y --refresh;;
+        azurelinux) true;;
         * ) ;;
     esac
-    check_exit_code "Package update works" "Package update fails!"
+    check_exit_code "No stale packages" "Stale packages found!"
 }
 
 function verify_azcopy_installation {
@@ -236,14 +277,6 @@ function verify_gcc_installation {
     check_exit_code "GCC is installed" "GCC doesn't exist!"
 }
 
-# Check module file for the explicit installations
-function verify_gcc_modulefile {
-    # Verify GCC Software installation path
-    check_exists "/opt/gcc-${VERSION_GCC}/"
-    # Verify GCC module file path
-    check_exists "${MODULE_FILES_ROOT}/gcc-${VERSION_GCC}"
-}
-
 function verify_aocl_installation {
     # verify AMD modulefiles
     check_exists "${MODULE_FILES_ROOT}/amd/aocl"
@@ -264,10 +297,21 @@ function verify_docker_installation {
     sudo docker rmi hello-world
 }
 
-function verify_ipoib_status {
-    # Check if the module ib_ipoib is inserted
-    lsmod | grep ib_ipoib
-    check_exit_code "ib_ipoib module is inserted" "ip_ipoib module not inserted!"
+function verify_ib_modules_and_devices {
+    if ! systemctl is-active openibd > /dev/null 2>&1; then
+        echo "*** openibd service is not active!" >&2
+        systemctl status openibd >&2
+        exit_on_error
+    else
+        echo "[OK] : openibd service is active"
+    fi
+
+    # Check if all key IB modules are inserted
+    local ib_modules=("ib_uverbs" "ib_umad" "ib_ipoib" "ib_cm" "ib_core")
+    for module in "${ib_modules[@]}"; do
+        lsmod | grep "^${module}"
+        check_exit_code "${module} module is inserted" "${module} module not inserted!"
+    done
 
     # Check if ib devices are listed
     ip addr | grep ib
@@ -279,7 +323,7 @@ function verify_lustre_installation {
     case ${ID} in
         ubuntu) dpkg -l | grep lustre-client;;
         almalinux) dnf list installed | grep lustre-client;;
-        azurelinux) dnf list installed | grep lustre-client;;
+        azurelinux) true;;
         * ) ;;
     esac
     check_exit_code "Lustre Installed" "Lustre not installed!"
@@ -296,7 +340,7 @@ function verify_pssh_installation {
     case ${ID} in
         ubuntu) dpkg -l | grep pssh;;
         almalinux) dnf list installed | grep pssh;;
-        azurelinux) dnf list installed | grep pssh;;
+        azurelinux) tdnf list installed | grep pssh;;
         * ) ;;
     esac
     check_exit_code "PSSH Installed" "PSSH not installed!"
@@ -312,7 +356,7 @@ function verify_dcgm_installation {
     case ${ID} in
         ubuntu) dpkg -l | grep datacenter-gpu-manager;;
         almalinux) dnf list installed | grep datacenter-gpu-manager;;
-        azurelinux) dnf list installed | grep datacenter-gpu-manager;;
+        azurelinux) tdnf list installed | grep datacenter-gpu-manager;;
         * ) ;;
     esac
     check_exit_code "DCGM Installed" "DCGM not installed!"
@@ -346,4 +390,62 @@ function verify_sunrpc_tcp_settings_service {
     # Check if the sunrpc TCP settings service is active
     systemctl is-active --quiet sunrpc_tcp_settings
     check_exit_code "sunrpc TCP settings service is active" "sunrpc TCP settings service is inactive/dead!"
+}
+
+function verify_azure_persistent_rdma_naming_service {
+    # Check if the azure persistent rdma naming service is active
+    systemctl is-active --quiet azure_persistent_rdma_naming
+    check_exit_code "Azure persistent rdma naming service is active" "Azure persistent rdma naming service is inactive/dead!"
+}
+
+function verify_nvbandwidth_setup {
+    # Verify nvbandwidth setup
+    /opt/nvidia/nvbandwidth/nvbandwidth
+    check_exit_code "NV Bandwidth Installed!" "Issue with NV Bandwidth installation!"
+}
+
+function verify_nvloom_setup {
+    # Verify nvloom setup
+    module load mpi/hpcx
+    gpu_num=$(nvidia-smi -L | wc -l) 
+    mpirun -np $gpu_num /opt/nvidia/nvloom/nvloom_cli -s gpu-to-rack
+    check_exit_code "NV Loom Installed!" "Issue with NV Loom installation!"
+    module unload mpi/hpcx
+}
+
+function verify_nvlink_setup {
+    # Verify nvlink setup
+    nvidia-smi nvlink --status
+    check_exit_code "NVLINK Reports Healthy" "Unhealthy NVLINK setup!"
+
+    if [[ "$VMSIZE" == "standard_nd128isr_ndr_gb200_v6" || "$VMSIZE" == "standard_nd128isr_gb300_v6" ]]; then
+        nvidia_smi_output=$(nvidia-smi -q | grep 'Fabric' -A 4)
+        echo "$nvidia_smi_output"
+        echo "$nvidia_smi_output" | grep -q 'N/A'
+        if [ $? -eq 0 ]; then
+            echo "*** Error - Unhealthy NVLINK setup!!"
+            exit -1
+        else
+            echo "[OK] : NVLINK setup is healthy"
+        fi
+    fi    
+}
+
+function verify_nvidia_imex_service {
+    check_exists /usr/lib/systemd/system/nvidia-imex.service
+    # Check if nvidia caps imex channel exists
+    ls -al /dev/nvidia-caps-imex-channels/channel0
+    check_exit_code "NVIDIA Caps Imex channel exists" "NVIDIA Caps Imex channel does not exist!"
+}
+
+function verify_mpifileutils_installation {
+    # Verify mpifileutils binaries exist
+    check_exists "/opt/mpifileutils/bin/dbcast"
+    check_exists "/opt/mpifileutils/bin/dcp"
+    check_exists "/opt/mpifileutils/bin/dsync"
+    # Verify it runs (requires MPI libraries)
+    module load mpi/hpcx
+    /opt/mpifileutils/bin/dbcast --help > /dev/null 2>&1
+    check_exit_code "mpifileutils ${VERSION_MPIFILEUTILS}" "mpifileutils not working!"
+    module unload mpi/hpcx
 }
